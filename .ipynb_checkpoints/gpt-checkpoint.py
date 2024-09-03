@@ -2,16 +2,44 @@ import numpy as np
 import math
 import torch
 from torch import nn
+from torch.nn import functional as F
 
-k = 50000
+
+k = 70000
 input_file_path = './data/mr.txt'
 output_file_path = f"./data/mr_{k}.txt"
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+elif torch.backends.mps.is_available():
+    device = 'mps'
 batch_size = 32
-context_size = 9
-num_iterations = 10000
-eval_iters = 10
-eval_interval = 1000 
+# context_size = 9
+context_size = 64
+num_iterations = 100000
+# eval_iters = 10
+eval_iters = 100
+# eval_interval = 1000 
+eval_interval = 1000
+embedding_dim = 516
+num_layers = 8
+num_heads = 4
+dropout = 0.2
+weights_path = '/Users/mayurb/src/open/marathiModels/weights/gpt2_marathi.pth'
+
+
+# input => batch x context_size x vocab_size
+# embedding => vocab_size x embedding_dim => results in => context_size x embedding_dim => 9 * 32
+# position => context_size x embedding_dim => results in => context_size x embedding_dim => 9 * 32
+# Num model parameters calculation
+# Embedding table: vocab_size * embedding_dim => 332 * 32 => 10624
+# Position table: context_size * embedding_dim => 9 * 32
+# Blocks: num_layers * (3 * embedding_dim^2) => 8 * (3 * 32^2)  
+# where, Block = MultiHeadAttention + FeedForward + 2 * LayerNorm
+# where, MultiHeadAttention = num_heads * (3 * embedding_dim^2)
+# where head = embedding_dim // num_heads
+# Norm: 2 * embedding_dim
+# lm_head: embedding_dim * vocab_size
 
 
 # READ DATA
@@ -72,7 +100,7 @@ print(f"Filtered length: {len(data)}")
 
 
 # TRAIN-TEST split
-n = math.floor(0.9 * len(data))
+n = math.floor(0.9 * len(all_data))
 train_data = all_data[:n]
 val_data = all_data[n:]
 print(f"Train data size: {len(train_data)}")
@@ -89,11 +117,13 @@ def get_batch(split, batch_size, context_size):
         start_index = torch.randint(0, len(data_item) - context_size, (1,))[0].item()
         x = data_item[start_index:start_index+context_size]
         y = data_item[start_index+1:start_index+context_size+1]
+        x, y = torch.tensor(x), torch.tensor(y)
+        x, y = x.to(device), y.to(device)
         X.append(x)
         Y.append(y)
-        x, y = torch.tensor(X), torch.tensor(Y)
-        x, y = x.to(device), y.to(device)
-    return torch.tensor(X), torch.tensor(Y)
+    # return torch.tensor(X), torch.tensor(Y)
+    # return X, Y
+    return torch.stack(X), torch.stack(Y)
 
 
 @torch.no_grad()
@@ -108,19 +138,96 @@ def estimate_loss():
             losses[k] = loss.item()
         loss_mean = losses.mean()
         loss_item[split] = loss_mean
+    # save the weights
+    torch.save(model.state_dict(), weights_path)
     model.train()
     return loss_item
 
-from torch.nn import functional as F
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(embedding_dim, head_size)
+        self.query = nn.Linear(embedding_dim, head_size)
+        self.value = nn.Linear(embedding_dim, head_size)
+        self.register_buffer('mask', torch.tril(torch.ones(context_size, context_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        
+        batch_size, context_size, embedding_dim = x.shape
+        
+        key = self.key(x) # batch_size, context_size, head_size
+        query = self.query(x) # batch_size, context_size, head_size
+        wei = key @ query.transpose(-1, -2) * key.shape[-1]**-0.5 # (batch_size, context_size, head_size) @ (batch_size, head_size, context_size) = (batch_size, context_size, context_size)
+        wei = wei.masked_fill(self.mask[:context_size, :context_size] == 0, float('-inf')) # batch_size, context_size, context_size
+        wei = F.softmax(wei, dim=-1) # batch_size, context_size, context_size
+        wei = self.dropout(wei)
+        
+        value = self.value(x) # batch_size, context_size, head_size
+        out = wei @ value # (batch_size, context_size, context_size) @ (batch_size, context_size, head_size) = (batch_size, context_size, head_size)
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.projection = nn.Linear(num_heads * head_size, num_heads * head_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        heads = [head(x) for head in self.heads] # num_heads, batch_size, context_size, head_size
+        out = torch.cat(heads, dim=-1)
+        out = self.projection(out)
+        out = self.dropout(out)
+        return out
+        
+class FeedForward(nn.Module):
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embedding_dim, 4 * embedding_dim),
+            nn.ReLU(),
+            nn.Linear(4 * embedding_dim, embedding_dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, num_heads, embedding_dim):
+        super().__init__()
+        self.sa_heads = MultiHeadAttention(num_heads, embedding_dim//num_heads)
+        self.feed_forward = FeedForward(embedding_dim)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
+        
+    def forward(self, x):
+        x = x + self.sa_heads(self.norm1(x))
+        x = x + self.feed_forward(self.norm2(x))
+        return x
 
 class BiagramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
-        self.embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.embedding_table = nn.Embedding(vocab_size, embedding_dim)
+        self.position_table = nn.Embedding(context_size, embedding_dim)
+        self.blocks = nn.Sequential(*[Block(num_heads, embedding_dim) for _ in range(num_layers)])
+        self.norm = nn.LayerNorm(embedding_dim)
+        self.lm_head = nn.Linear(embedding_dim, vocab_size)
 
     def forward(self, x, y):
-        logits = self.embedding_table(x) #batch_size, context_size, vocab_size
+        
+        batch_size, context_size = x.shape
+
+        embeddings = self.embedding_table(x) # batch_size, context_size, embedding_dim
+        position_embeddings = self.position_table(torch.arange(context_size, device=device)) # context_size, embedding_dim
+        x = embeddings + position_embeddings
+        x = self.blocks(x) # batch_size, context_size, embedding_dim
+        x = self.norm(x) # batch_size, context_size, embedding_dim
+        logits = self.lm_head(x) #batch_size, context_size, vocab_size
         if y is not None:
             batch, context, embedding = logits.shape
             assert(batch == batch_size)
@@ -140,7 +247,8 @@ class BiagramLanguageModel(nn.Module):
 
     def generate(self, x, max_tokens):
         for _ in range(max_tokens):
-            logits, loss = self(x, None)
+            x_trimmed = x[:, -context_size:]
+            logits, loss = self(x_trimmed, None)
             logits_filtered = logits[:, -1,:]
             probs = F.softmax(logits_filtered, dim=1)
             selected = torch.multinomial(probs, 1)
@@ -148,21 +256,21 @@ class BiagramLanguageModel(nn.Module):
             x = torch.cat((x, selected), dim=1)
         return x
 
-
-model = BiagramLanguageModel(vocab_size)
+model = BiagramLanguageModel()
 m = model.to(device)
 optimiser = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 
-for i in range(num_iterations):
-    x, y = get_batch('train', batch_size, context_size)
-    logits, loss = model(x, y)
-    optimiser.zero_grad(set_to_none=True)
-    loss.backward()
-    if i % eval_interval == 0:
-        loss_item = estimate_loss()
-        print(f"Iteration: {i}, Train loss: {loss_item['train']}, Validation loss: {loss_item['val']}")
-    optimiser.step()
+def train_model():
+    for i in range(num_iterations):
+        x, y = get_batch('train', batch_size, context_size)
+        logits, loss = model(x, y)
+        optimiser.zero_grad(set_to_none=True)
+        loss.backward()
+        if i % eval_interval == 0:
+            loss_item = estimate_loss()
+            print(f"Iteration: {i}, Train loss: {loss_item['train']}, Validation loss: {loss_item['val']}")
+        optimiser.step()
 
 
 def generate_sentences(max_tokens):
@@ -170,6 +278,11 @@ def generate_sentences(max_tokens):
     inp = torch.zeros(1, 1, dtype=torch.long, device=device)
     inp[0][0] = feed
     generarted_text = model.generate(inp, max_tokens)
-    print(decode(generarted_text.numpy()[0]))
+    print(decode(generarted_text.cpu().numpy()[0]))
 
-generate_sentences(1000)
+# train_model()
+# generate_sentences(1000)
+    
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total parameters: {total_params}")
+print("Vocab size: ", vocab_size)

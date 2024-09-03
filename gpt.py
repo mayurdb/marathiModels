@@ -280,8 +280,8 @@ def generate_sentences(max_tokens):
     generarted_text = model.generate(inp, max_tokens)
     print(decode(generarted_text.cpu().numpy()[0]))
 
-train_model()
-generate_sentences(1000)
+# train_model()
+# generate_sentences(1000)
     
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total parameters: {total_params}")
